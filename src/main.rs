@@ -1,13 +1,13 @@
 use axum::{
     body::Bytes,
-    extract::{BodyStream, Multipart, Path},
+    extract::{DefaultBodyLimit, Multipart, Path, Request},
     http::StatusCode,
     response::{Html, Redirect},
     routing::{get, post},
     BoxError, Router,
 };
 use futures::{Stream, TryStreamExt};
-use std::{io, net::SocketAddr};
+use std::io;
 use tokio::{fs::File, io::BufWriter};
 use tokio_util::io::StreamReader;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -24,21 +24,15 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // save files to a separate directory to not override files in the current directory
-    tokio::fs::create_dir(UPLOADS_DIRECTORY)
-        .await
-        .expect("failed to create `uploads` directory");
-
     let app = Router::new()
-        .route("/", get(show_form).post(accept_form))
-        .route("/file/:file_name", post(save_request_body));
+        .route("/uploads", get(show_form).post(accept_form)).layer(DefaultBodyLimit::disable())
+        .route("/file/:file_name", post(save_request_body)).layer(DefaultBodyLimit::disable());
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    tracing::debug!("listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
 }
 
 // Handler that streams the request body to a file.
@@ -46,9 +40,9 @@ async fn main() {
 // POST'ing to `/file/foo.txt` will create a file called `foo.txt`.
 async fn save_request_body(
     Path(file_name): Path<String>,
-    body: BodyStream,
+    request: Request,
 ) -> Result<(), (StatusCode, String)> {
-    stream_to_file(&file_name, body).await
+    stream_to_file(&file_name, request.into_body().into_data_stream()).await
 }
 
 // Handler that returns HTML for a multipart form.
@@ -61,7 +55,7 @@ async fn show_form() -> Html<&'static str> {
                 <title>Upload something!</title>
             </head>
             <body>
-                <form action="/" method="post" enctype="multipart/form-data">
+                <form action="/uploads" method="post" enctype="multipart/form-data">
                     <div>
                         <label>
                             Upload file:
@@ -81,7 +75,7 @@ async fn show_form() -> Html<&'static str> {
 
 // Handler that accepts a multipart form upload and streams each field to a file.
 async fn accept_form(mut multipart: Multipart) -> Result<Redirect, (StatusCode, String)> {
-    while let Some(field) = multipart.next_field().await.unwrap() {
+    while let Ok(Some(field)) = multipart.next_field().await {
         let file_name = if let Some(file_name) = field.file_name() {
             file_name.to_owned()
         } else {
@@ -91,7 +85,7 @@ async fn accept_form(mut multipart: Multipart) -> Result<Redirect, (StatusCode, 
         stream_to_file(&file_name, field).await?;
     }
 
-    Ok(Redirect::to("/"))
+    Ok(Redirect::to("/uploads"))
 }
 
 // Save a `Stream` to a file
